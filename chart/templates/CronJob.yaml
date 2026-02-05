@@ -1,0 +1,94 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: backup-vault
+  namespace: "secrets"
+spec:
+  schedule: "@daily"
+  timeZone: Europe/Moscow
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 86400
+      template:
+        spec:
+          restartPolicy: Never
+          serviceAccountName: vault-sa
+          nodeSelector:
+            kubernetes.io/hostname: "control02"
+          tolerations:
+            - key: "node-role.kubernetes.io/control-plane"
+              operator: "Exists"
+              effect: "NoSchedule"
+          containers:
+            - name: backup-vault
+              image: {{ .Values.vault.server.image.repository }}:{{ .Values.vault.server.image.tag | default "latest" }}
+              imagePullPolicy: Always
+              env:
+                - name: VAULT_ADDR
+                  value: 'https://vault.secrets.svc:8200'
+                - name: VAULT_CACERT
+                  value: '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt'
+                - name: VAULT_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: vault
+                      key: token
+                - name: VAULT_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: vault
+                      key: key
+              command:
+                - ash
+                - -c
+                - |
+                  /backup.sh
+              volumeMounts:
+                - mountPath: /backup.sh
+                  name: vault-init
+                  subPath: backup.sh
+                  readOnly: true
+                - name: backup
+                  mountPath: /backup
+                - name: vault-data
+                  mountPath: /data
+          dnsPolicy: ClusterFirst
+          volumes:
+            - name: vault-init
+              configMap:
+                defaultMode: 0744
+                name: vault-init
+                items:
+                  - key: backup.sh
+                    path: backup.sh
+            - name: backup
+              persistentVolumeClaim:
+                claimName: backup-vault-pvc
+            - name: vault-data
+              persistentVolumeClaim:
+                claimName: data-vault-0
+            - name: sa-token
+              projected:
+                defaultMode: 420
+                sources:
+                  - serviceAccountToken:
+                      expirationSeconds: 3600
+                      path: token
+                  - configMap:
+                      items:
+                        - key: ca.crt
+                          path: ca.crt
+                      name: kube-root-ca.crt
+                  - downwardAPI:
+                      items:
+                        - fieldRef:
+                            apiVersion: v1
+                            fieldPath: metadata.namespace
+                          path: namespace
+---
+                
+                

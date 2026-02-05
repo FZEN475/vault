@@ -1,0 +1,35 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: "cm-vault-tls"
+  namespace: "secrets"
+spec:
+  isCA: false
+  # Secret names are always required.
+  secretName: "cm-vault-tls"
+  secretTemplate:
+    annotations:
+      app-name: "vault"
+  usages:
+    - digital signature
+    - key encipherment
+    - server auth
+    - client auth
+  subject:
+    organizations:
+      - cert-manager
+  dnsNames: 
+    - 'vault.fizn.ru'
+    - 'vault.secrets.svc'
+  ipAddresses:
+    - 127.0.0.1
+  emailAddresses:
+    - admin@fizn.ru
+  additionalOutputFormats:
+    - type: CombinedPEM
+  issuerRef:
+    name: "root-intermediate0-ci"
+    kind: ClusterIssuer
+    group: cert-manager.io
+    
+---

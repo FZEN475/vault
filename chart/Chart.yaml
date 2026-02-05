@@ -1,0 +1,14 @@
+apiVersion: v2
+name: vault
+version: 1.0.0
+description: "vault"
+type: application
+maintainers:
+  - name: FZEN
+    email: admin@fzen.pro
+    url: https://fzen.pro
+appVersion: 1.0.0
+dependencies:
+  - name: vault
+    version: "=0.32.0"
+    repository: 'https://helm.releases.hashicorp.com'

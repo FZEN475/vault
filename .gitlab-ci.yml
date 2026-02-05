@@ -1,0 +1,287 @@
+include:
+  - component: $CI_SERVER_FQDN/library/to-be-continuous/Helm/gitlab-ci-helm@master
+    inputs:
+      chart-dir: chart
+      repos: 'vault@https://helm.releases.hashicorp.com'
+      k8s-version: 'v1.31'
+      
+      publish-on: tag
+      publish-strategy: none
+      
+      deploy-args: upgrade --install --rollback-on-failure --timeout 5m0s
+      
+      prod-enabled: true
+      prod-deploy-strategy: auto
+      prod-app-name: vault
+      prod-namespace: secrets
+
+  - component: $CI_SERVER_FQDN/library/cicd/auto-release/auto-release@main
+    inputs:
+      auto-rebase: true
+      auto-approve: true
+
+      auto-merge: true
+      auto-remove-source-branch: true
+
+      auto-tag: false
+      auto-tag-pattern: '/^\d+\.\d+\.\d+$/'
+      auto-tag-version-major: 0
+      auto-tag-version-minor: 4
+
+      auto-release: true
+
+variables:
+  CI_DEBUG_TRACE: "false"
+  TRACE: "false"
+  
+  KUBE_CONTEXT: "infra-gitops/kas-config:agent-group-infra-gitops"
+  
+  ADAPTIVE_PIPELINE_DISABLED: "true"
+
+  HELM_MIRROR_REPO: "ghcr.io/fzen475/vault" #repository name must be lowercase
+
+stages:
+  - build                                # Нет job
+  - test                                 # helm-lint, helm-values-lint-review, helm-values-lint-integration, helm-values-lint-staging, helm-values-lint-production
+  - package-build                        # helm-package
+  - package-test                         # helm-score-review, helm-score-integration, helm-score-staging, helm-score-production
+  - infra                                # Нет job
+  - deploy                               # helm-review, helm-integration, helm-staging, helm-production, helm-cleanup-review, helm-cleanup-integration, helm-cleanup-staging
+  - acceptance                           # helm-test-review, helm-test-integration, helm-test-staging
+  - publish                              # helm-publish
+  - infra-prod                           # Нет job
+  - production                           # helm-production
+
+  - auto-merge
+  - auto-tag
+  - auto-release
+
+# Заменяется целый job ради одной строки!
+.helm-score:
+  extends: .helm-deploy-base
+  image:
+    name: $HELM_KUBE_SCORE_IMAGE
+    entrypoint: [""]
+  stage: package-test
+  before_script:
+    - !reference [.helm-scripts]
+    - install_ca_certs "${CUSTOM_CA_CERTS:-$DEFAULT_CA_CERTS}"
+    - add_helm_repositories # <--- Этой!
+    - |
+      if [ -f "$HELM_CHART_DIR/Chart.yaml" ]
+      then
+        helm $HELM_DEPENDENCY_ARGS $HELM_CHART_DIR
+        helm_package=$HELM_CHART_DIR
+      elif [ ! -z "${HELM_DEPLOY_CHART}" ]
+      then
+        add_helm_repositories
+        helm_package=$HELM_DEPLOY_CHART
+      else
+        log_error "You need at least one Chart.yaml or external deploy chart reference"
+        exit 1
+      fi
+  script:
+    - TBC_ENVSUBST_ENCODING=jsonstr tbc_envsubst "${HELM_COMMON_VALUES:-/dev/null}" > generated-values-common.yml
+    - TBC_ENVSUBST_ENCODING=jsonstr tbc_envsubst "$ENV_VALUES" > generated-values-env.yml
+    - helm template $helm_package ${HELM_K8S_VERSION:+--kube-version "$HELM_K8S_VERSION"} --values generated-values-common.yml --values generated-values-env.yml | kube-score score ${HELM_K8S_VERSION:+--kubernetes-version "$HELM_K8S_VERSION"} ${HELM_KUBE_SCORE_ARGS} -
+
+.configure_cosign_private_key: &configure_cosign_private_key |
+  function configure_cosign_private_key() {
+    if [[ -z "${DOCKER_COSIGN_PRIVATE_KEY:-$COSIGN_PRIVATE_KEY}" ]]
+    then
+      fail "Cosign private key is not defined"
+    fi
+    if [[ -f "${DOCKER_COSIGN_PRIVATE_KEY:-$COSIGN_PRIVATE_KEY}" ]]
+    then
+      docker_cosign_private_key=${DOCKER_COSIGN_PRIVATE_KEY:-$COSIGN_PRIVATE_KEY}
+    else
+      mkdir -p /tmp
+      docker_cosign_private_key=$(mktemp)
+      echo "${DOCKER_COSIGN_PRIVATE_KEY:-$COSIGN_PRIVATE_KEY}" > "$docker_cosign_private_key"
+    fi
+    export docker_cosign_private_key
+  }
+
+helm-cosign:
+  extends: .helm-deploy-base
+  image:
+    name: bitnami/cosign
+  needs:
+    - job: helm-package
+    - job: helm-publish
+  stage: publish
+  variables:
+    GITLAB_TOKEN: "$CI_JOB_TOKEN"
+  before_script:
+    - !reference [.helm-scripts]
+    - install_ca_certs "${CUSTOM_CA_CERTS:-$DEFAULT_CA_CERTS}"
+    - !reference [.configure_cosign_private_key]
+  script:
+    - mkdir -p $HOME/.docker/
+    - cp /tmp/config.json $HOME/.docker/
+    - SOURCE_URL="$CI_REGISTRY/$CI_PROJECT_PATH/charts/$helm_package_name:$helm_package_version"
+    - log_info "$SOURCE_URL"
+    - configure_cosign_private_key
+    - DOCKER_COSIGN_ANNOTATIONS=(
+      --annotations com.gitlab.ci.project.path="$CI_PROJECT_URL"
+      --annotations com.gitlab.ci.user.name="$GITLAB_USER_NAME"
+      --annotations com.gitlab.ci.pipeline.id="$CI_PIPELINE_ID"
+      --annotations com.gitlab.ci.pipeline.url="$CI_PIPELINE_URL"
+      --annotations com.gitlab.ci.job.id="$CI_JOB_ID"
+      --annotations com.gitlab.ci.job.url="$CI_JOB_URL"
+      --annotations com.gitlab.ci.commit.sha="$CI_COMMIT_SHA"
+      --annotations com.gitlab.ci.commit.ref.name="$CI_COMMIT_REF_NAME"
+      --annotations com.gitlab.ci.runner.id="$CI_RUNNER_ID"
+      --annotations com.gitlab.ci.runner.version="$CI_RUNNER_VERSION"
+      --annotations com.gitlab.ci.job.started-at="$CI_JOB_STARTED_AT"
+      --annotations com.gitlab.ci.registry.image="$CI_REGISTRY/$CI_PROJECT_PATH/charts/$helm_package_name"
+      --annotations org.opencontainers.image.source="$CI_PROJECT_URL"
+      --annotations org.opencontainers.image.revision="$CI_COMMIT_SHA"
+      --annotations tag="$helm_package_version"
+      )
+    - |
+      cosign sign \
+        --key "${docker_cosign_private_key}" \
+        "${DOCKER_COSIGN_ANNOTATIONS[@]}" \
+        "$SOURCE_URL"
+  rules:
+    - !reference [ .tagged, only ]
+    - when: on_success
+
+helm-mirror:
+  extends: .helm-deploy-base
+  image:
+    name: quay.io/containers/skopeo:latest
+  needs:
+    - job: helm-package
+    - job: helm-publish
+    - job: helm-cosign
+  stage: publish
+  before_script:
+    - !reference [.helm-scripts]
+    - install_ca_certs "${CUSTOM_CA_CERTS:-$DEFAULT_CA_CERTS}"
+  script:
+    - SOURCE="$CI_REGISTRY/$CI_PROJECT_PATH/charts/$helm_package_name"
+    - DIGEST="sha256-$(skopeo inspect --raw --authfile /tmp/config.json docker://"$SOURCE":$helm_package_version | sha256sum | awk '{print $1}')"
+    - log_info "$DIGEST"
+    - |
+      skopeo copy --all \
+        --authfile /tmp/config.json \
+        docker://"$SOURCE":$DIGEST \
+        docker://"$HELM_MIRROR_REPO":$DIGEST
+    - log_info "Copying Helm chart from $SOURCE:$helm_package_version to $HELM_MIRROR_REPO:$helm_package_version"
+    - |
+      skopeo copy --all \
+        --authfile /tmp/config.json \
+        docker://"$SOURCE":$helm_package_version \
+        docker://"$HELM_MIRROR_REPO":$helm_package_version
+  rules:
+    - !reference [ .tagged, only ]
+    - when: on_success
+
+.helm-deploy-base:
+  extends: .helm-base
+  tags:
+    - helm
+
+.auto-rebase-needs:
+  - job: helm-lint
+    optional: true
+  - job: helm-package
+    optional: true
+  - job: helm-review
+    optional: true
+  - job: helm-integration
+    optional: true
+  - job: helm-staging
+    optional: true
+  - job: helm-production
+    optional: true
+
+.auto-approve-needs:
+  - job: helm-lint
+    optional: true
+  - job: helm-package
+    optional: true
+  - job: helm-review
+    optional: true
+  - job: helm-integration
+    optional: true
+  - job: helm-staging
+    optional: true
+  - job: helm-production
+    optional: true
+
+.auto-merge-needs:
+  - job: helm-lint
+    optional: true
+  - job: helm-package
+    optional: true
+  - job: helm-review
+    optional: true
+  - job: helm-integration
+    optional: true
+  - job: helm-staging
+    optional: true
+  - job: helm-production
+    optional: true
+
+.auto-create-TAG-needs:
+  - job: helm-lint
+    optional: true
+  - job: helm-package
+    optional: true
+  - job: helm-review
+    optional: true
+  - job: helm-integration
+    optional: true
+  - job: helm-staging
+    optional: true
+  - job: helm-production
+    optional: true
+
+.auto-release-needs:
+  - job: helm-lint
+    optional: true
+  - job: helm-package
+    optional: true
+  - job: generate_release_env_file
+  - job: helm-publish
+    optional: true
+  - job: helm-cosign
+    optional: true
+  - job: helm-mirror
+    optional: true
+
+generate_release_env_file:
+  stage: package-build
+  image: registry.gitlab.com/gitlab-org/cli:latest
+  needs:
+    - helm-package
+  before_script:
+    - !reference [ .install-utility ]
+  script:
+    - |
+      arg_image=$(printf '```bash\noci://%s/%s/charts/%s:%s\n```\n---\n' \
+        "$CI_REGISTRY" "$CI_PROJECT_PATH" "$helm_package_name" "$helm_package_version")
+
+      log_info "$arg_image"
+      latest_url="[latest]($CI_PROJECT_URL/-/releases/permalink/latest)"
+      # Формируем release notes для helm chart
+      release_notes_helm=$(jq -n \
+        --arg head "Helm cart oci" \
+        --arg image "$arg_image" \
+        --arg latest "$latest_url" \
+        '{head: $head, image: $image, latest: $latest}' | base64 -w0
+      )
+
+      {
+        echo "release_notes_helm=$release_notes_helm"
+      } > release.env
+
+  rules:
+    - !reference [ .tagged, only ]
+    - when: on_success
+  artifacts:
+    reports:
+      dotenv: release.env

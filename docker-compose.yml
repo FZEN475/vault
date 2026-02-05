@@ -1,0 +1,37 @@
+services:
+  vault:
+    image: ghcr.io/fzen475/helm-install:latest
+    container_name: helm-vault
+    env_file: ./.env
+    environment:
+      TRACE: false
+      CUSTOM_CA_CERTS: "/tmp/ca.crt"
+      KUBECONFIG: "/root/.kube/config"
+      
+      HELM_REPOS: "vault@https://helm.releases.hashicorp.com" # "extra_chart_1@oci:// extra_chart_2@oci://"
+
+      ENV_VALUES: ""
+      ENV_NAMESPACE: "secrets"
+      ENV_APP_NAME: "vault"
+      HELM_DEPLOY_CHART: "./chart/" # ./chart/ или gitlab/gitlab
+
+      DELETE_HELM: false
+      HELM_DELETE_ARGS: "uninstall"
+
+      INSTALL_HELM: true
+      HELM_DEPLOY_ARGS: 'upgrade --install --rollback-on-failure --wait=hookOnly --timeout 5m0s'
+    volumes:
+      - /tmp/vault:/source
+    secrets:
+      - source: kubeconfig
+        target: /root/.kube/config
+        mode: 0600
+      - source: ca.crt
+        target: /tmp/ca.crt
+        mode: 0600
+
+secrets:
+  kubeconfig:
+    file: /root/.kube/config
+  ca.crt:
+    file: /etc/ssl/certs/ca.crt
